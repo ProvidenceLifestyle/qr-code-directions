@@ -1,0 +1,1147 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { MapContainer, Marker, useMap, useMapEvents } from "react-leaflet";
+import type { Map as LeafletMap } from "leaflet";
+import { fixDefaultLeafletIcon } from "@/lib/map/fix-default-icon";
+import { siteDivIcon, labelledSiteDivIcon } from "@/lib/map/site-icon";
+import { analyseSiteNumbers, summariseRanges } from "@/lib/sites/missing-site-numbers";
+import { BasemapTileLayer } from "@/components/map/basemap-tile-layer";
+import { PlanImageOverlay } from "@/components/map/plan-image-overlay";
+import { georeferencePlan } from "@/lib/geo/plan-georeference";
+import { loadMasterplanDraft } from "@/app/(admin)/admin/(protected)/resorts/[resortId]/import-masterplan/actions";
+import type { StoredCalibrationPoint } from "@/lib/geo/plan-calibration";
+import type { SiteStatus } from "@/lib/types";
+import type { ActionState } from "@/app/(admin)/admin/(protected)/resorts/[resortId]/sites/actions";
+import { SiteNumberInput } from "@/components/admin/site-number-input";
+import "leaflet/dist/leaflet.css";
+
+export interface CapturedSite {
+  id: string;
+  site_number: string;
+  label: string | null;
+  lat: number;
+  lng: number;
+  status: SiteStatus;
+}
+
+interface PendingPin {
+  lat: number;
+  lng: number;
+}
+
+// One step of history, holding whatever is needed to put things back.
+//
+// Pins are draggable so positions can be corrected, which means a pinch
+// to zoom that lands slightly off nudges a house across the map instead -
+// easy to do on a phone, and easy not to notice until much later.
+type UndoEntry =
+  | { kind: "move"; siteId: string; siteNumber: string; lat: number; lng: number }
+  | { kind: "add"; siteId: string; siteNumber: string }
+  | { kind: "delete"; site: CapturedSite }
+  | { kind: "status"; siteId: string; siteNumber: string; status: SiteStatus }
+  | { kind: "rename"; siteId: string; siteNumber: string };
+
+const UNDO_LIMIT = 25;
+const PINS_LOCKED_KEY = "capture-pins-locked";
+
+/** Which site a step refers to, whatever kind of step it is. */
+function undoTarget(entry: UndoEntry): string {
+  return entry.kind === "delete" ? entry.site.id : entry.siteId;
+}
+
+function describeUndo(entry: UndoEntry): string {
+  switch (entry.kind) {
+    case "move":
+      return `move of ${entry.siteNumber}`;
+    case "add":
+      return `adding ${entry.siteNumber}`;
+    case "delete":
+      return `deleting ${entry.site.site_number}`;
+    case "status":
+      return `status of ${entry.siteNumber}`;
+    case "rename":
+      return `renaming ${entry.siteNumber}`;
+  }
+}
+
+// Drops a pin where the map is tapped - but not when the tap was really
+// aimed at a popup.
+//
+// Pressing Save (or Cancel, or Delete) inside a popup also reaches the
+// map underneath, which dropped a brand new unnamed pin exactly where you
+// were working: the stray dots that had to be cleaned up afterwards, and
+// a phantom extra "home captured" in the count.
+//
+// The check has to happen when the button is pressed, not when the click
+// arrives. Leaflet delays the map click (it disambiguates taps on touch
+// devices), so by the time it fires, the save has finished, React has
+// unmounted the popup, and the event's target is an orphaned element
+// whose ancestors no longer say it was ever in a popup.
+// Says why the master plan can't be laid over the imagery. Hiding the
+// control and saying nothing left no way to tell an un-run migration from
+// a plan that was never uploaded.
+function PlanOverlayNote({
+  reason,
+  resortId,
+}: {
+  reason: "not-migrated" | "no-plan" | "not-calibrated";
+  resortId: string;
+}) {
+  // Deliberately quiet, not a warning. The captured sites on the map have
+  // nothing to do with this, and an amber panel saying "no master plan is
+  // saved" above a map covered in pins reads as "your work is missing".
+  const shell =
+    "rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs text-neutral-600";
+
+  if (reason === "not-migrated") {
+    return (
+      <p className={shell}>
+        <strong>Optional backdrop unavailable.</strong> The plan drawing
+        can&apos;t be laid over the imagery yet: the database is missing the
+        table that holds it. Run{" "}
+        <code>supabase/migrations/0002_masterplan_drafts.sql</code> in the
+        Supabase SQL editor. Your captured sites aren&apos;t affected.
+      </p>
+    );
+  }
+
+  if (reason === "not-calibrated") {
+    return (
+      <p className={shell}>
+        <strong>Optional backdrop unavailable.</strong> A plan drawing is
+        saved for this resort but was never matched to the map, so there&apos;s
+        nowhere to put it. Add at least two reference points in{" "}
+        <a href={`/admin/resorts/${resortId}/import-masterplan`} className="underline">
+          Import from master plan
+        </a>
+        . Your captured sites aren&apos;t affected.
+      </p>
+    );
+  }
+
+  return (
+    <p className={shell}>
+      <strong>Optional backdrop unavailable.</strong> The plan <em>drawing</em>
+      {" "}
+      isn&apos;t saved to your account, so it can&apos;t be shown underneath
+      these pins. This is only about the drawing — your captured sites are
+      safe. To add it, open{" "}
+      <a href={`/admin/resorts/${resortId}/import-masterplan`} className="underline">
+        Import from master plan
+      </a>{" "}
+      and either save the draft already on this device to your account, or
+      upload the PDF once. Either way you don&apos;t have to import the sites
+      again.
+    </p>
+  );
+}
+
+function ClickToAdd({ onPick }: { onPick: (lat: number, lng: number) => void }) {
+  const swallowNextClick = useRef(false);
+
+  const map = useMapEvents({
+    click(e) {
+      if (swallowNextClick.current) {
+        swallowNextClick.current = false;
+        return;
+      }
+      onPick(e.latlng.lat, e.latlng.lng);
+    },
+  });
+
+  useEffect(() => {
+    const container = map.getContainer();
+    // Set on every press, so a popup press that never produces a map
+    // click can't leave the flag armed and eat a later genuine tap.
+    const onPointerDown = (event: Event) => {
+      const target = event.target;
+      swallowNextClick.current =
+        target instanceof Element && target.closest(".leaflet-popup") !== null;
+    };
+    container.addEventListener("pointerdown", onPointerDown, true);
+    return () => container.removeEventListener("pointerdown", onPointerDown, true);
+  }, [map]);
+
+  return null;
+}
+
+// Frames the resort once, when the map first has sites to show.
+//
+// This used to live in the map's ref callback, which is the bug behind
+// the view snapping back: a ref callback declared inline is a new
+// function every render, so React detached and reattached it each time
+// and re-ran the fit. Saving a pin, deleting one, ticking Numbers, even
+// typing a character in the "jump to site" box threw the view back out
+// to the whole resort - far too small to work at with a few hundred
+// homes on it.
+//
+// It lives inside the map rather than beside it because useMap() is
+// guaranteed to have the map instance; the parent's ref isn't set yet
+// when the parent's own effects first run, so the fit would be skipped at
+// mount and then fire on the first edit instead - which looked identical
+// to the original bug.
+function FitToAllSitesOnce({ points }: { points: [number, number][] }) {
+  const map = useMap();
+  const done = useRef(false);
+
+  useEffect(() => {
+    if (done.current || points.length < 2) return;
+    done.current = true;
+    map.fitBounds(points, { padding: [50, 50] });
+  }, [map, points]);
+
+  return null;
+}
+
+export function SatelliteCaptureTool({
+  resortId,
+  initialSites,
+  totalHomes,
+  centerLat,
+  centerLng,
+  defaultZoom,
+  planCalibration,
+  planUnavailable,
+  addSite,
+  updateSiteLocation,
+  updateSiteDetails,
+  deleteSite,
+  restoreSite,
+  setSiteStatus,
+}: {
+  resortId: string;
+  initialSites: CapturedSite[];
+  totalHomes: number | null;
+  centerLat: number | null;
+  centerLng: number | null;
+  defaultZoom: number;
+  planCalibration: {
+    pairs: StoredCalibrationPoint[];
+    imageWidth: number;
+    imageHeight: number;
+  } | null;
+  /** Why there's no overlay to offer, when there isn't. */
+  planUnavailable: "not-migrated" | "no-plan" | "not-calibrated" | null;
+  addSite: (prevState: ActionState, formData: FormData) => Promise<ActionState>;
+  updateSiteLocation: (prevState: ActionState, formData: FormData) => Promise<ActionState>;
+  updateSiteDetails: (prevState: ActionState, formData: FormData) => Promise<ActionState>;
+  deleteSite: (formData: FormData) => Promise<void>;
+  restoreSite: (input: {
+    resortId: string;
+    siteNumber: string;
+    label: string | null;
+    status: SiteStatus;
+    lat: number;
+    lng: number;
+  }) => Promise<ActionState>;
+  setSiteStatus: (formData: FormData) => Promise<void>;
+}) {
+  const [sites, setSites] = useState<CapturedSite[]>(initialSites);
+  const [pending, setPending] = useState<PendingPin | null>(null);
+  const [newSiteNumber, setNewSiteNumber] = useState("");
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  // Every write, not just the Save button.
+  //
+  // Placing a site had a busy state; moving a pin, deleting, renaming and
+  // changing status did not - and those are most of what an afternoon in
+  // this tool actually consists of. Each of them rolls back and explains
+  // itself if it fails, so nothing was ever lost silently, but on a slow
+  // connection there was no way to tell a write that was still going from
+  // one that had already finished.
+  const [writesInFlight, setWritesInFlight] = useState(0);
+
+  /** Runs a write with the indicator on for as long as it takes. */
+  async function tracked<T>(work: () => Promise<T>): Promise<T> {
+    setWritesInFlight((n) => n + 1);
+    try {
+      return await work();
+    } finally {
+      setWritesInFlight((n) => n - 1);
+    }
+  }
+  const [searchTerm, setSearchTerm] = useState("");
+  const [showNumbers, setShowNumbers] = useState(true);
+  // Locked by default: reviewing and zooming is most of the work, and an
+  // accidental nudge is silent - the pin just ends up somewhere slightly
+  // wrong, which is exactly the kind of error this tool exists to find.
+  // Moving a pin is the rarer, deliberate act, so it's the one that asks
+  // for a tick.
+  const [pinsLocked, setPinsLocked] = useState<boolean>(() => {
+    // Remembered per browser. Wrapped because storage can be unavailable
+    // (private browsing, blocked site data) and a missing preference must
+    // not stop the tool loading.
+    try {
+      return window.localStorage.getItem(PINS_LOCKED_KEY) !== "false";
+    } catch {
+      return true;
+    }
+  });
+
+  function togglePinsLocked(locked: boolean) {
+    setPinsLocked(locked);
+    try {
+      window.localStorage.setItem(PINS_LOCKED_KEY, String(locked));
+    } catch {
+      // A preference that can't be remembered still works for this sitting.
+    }
+  }
+  const [showMissing, setShowMissing] = useState(false);
+  const [showUnexpected, setShowUnexpected] = useState(false);
+  const [siteNumberToPlace, setSiteNumberToPlace] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [selectedSiteId, setSelectedSiteId] = useState<string | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [undoStack, setUndoStack] = useState<UndoEntry[]>([]);
+  const [isUndoing, setIsUndoing] = useState(false);
+  // On from the start. This screen exists to check pins against the
+  // plan, and switching it on by hand every visit was a step with no
+  // decision in it. 75% keeps the imagery readable underneath.
+  const [showPlan, setShowPlan] = useState(true);
+  const [planOpacity, setPlanOpacity] = useState(0.75);
+  const [planImage, setPlanImage] = useState<string | null>(null);
+  const [planLoading, setPlanLoading] = useState(false);
+  const mapRef = useRef<LeafletMap | null>(null);
+
+  // The master plan, georeferenced by the calibration the import already
+  // captured. Checking a number against the printed plan is the whole job
+  // when the imagery is out of date or the roof is one of six identical
+  // ones in a row.
+  // Memoised, and that is not a nicety. Rebuilt on every render it is a
+  // new object each time, which re-runs anything depending on it - and
+  // the loader below depends on it. That is what left this screen
+  // reading "Loading the master plan image..." for ever: the re-run
+  // cancelled the fetch already in flight, and the cancelled run then
+  // skipped clearing the loading flag.
+  const georeference = useMemo(
+    () =>
+      planCalibration && centerLat !== null && centerLng !== null
+        ? georeferencePlan(
+            planCalibration.pairs,
+            planCalibration.imageWidth,
+            planCalibration.imageHeight,
+            { lat: centerLat, lng: centerLng }
+          )
+        : null,
+    [planCalibration, centerLat, centerLng]
+  );
+
+  function togglePlan(wanted: boolean) {
+    setShowPlan(wanted);
+    // Switching it back on is what anyone tries when it hasn't appeared,
+    // so make that actually retry rather than do nothing.
+    if (wanted && !planImage && !planLoading) {
+      planRequested.current = false;
+      setPlanRetry((n) => n + 1);
+    }
+  }
+
+  // Fetched once, on arrival, because the plan is shown from the start.
+  //
+  // The ref stops a second fetch of a couple of megabytes; the retry
+  // counter is how the toggle asks for another go after a failure.
+  const planRequested = useRef(false);
+  const [planRetry, setPlanRetry] = useState(0);
+  useEffect(() => {
+    if (!georeference || planImage || planRequested.current) return;
+    planRequested.current = true;
+    let active = true;
+    setPlanLoading(true);
+    void (async () => {
+      try {
+        const draft = await loadMasterplanDraft(resortId);
+        if (!active) return;
+        if (draft?.imageDataUrl) setPlanImage(draft.imageDataUrl);
+        else setActionError("There's no saved master plan image for this resort yet.");
+      } catch {
+        if (active) setActionError("Couldn't load the master plan image.");
+        // Let it be tried again; a fetch that failed once and can never
+        // be retried is worse than not having tried at all.
+        planRequested.current = false;
+      } finally {
+        // Cleared whether or not this run was superseded. Leaving it set
+        // is what strands the screen on "Loading...".
+        setPlanLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [georeference, resortId, planImage, planRetry]);
+
+  useEffect(() => {
+    fixDefaultLeafletIcon();
+  }, []);
+
+  const initialCenter: [number, number] =
+    sites.length > 0
+      ? [sites[0].lat, sites[0].lng]
+      : centerLat !== null && centerLng !== null
+        ? [centerLat, centerLng]
+        : [-31.9505, 115.8605];
+
+  async function handleSaveNewSite() {
+    if (!pending || !newSiteNumber.trim()) return;
+    setIsSaving(true);
+    setSaveError(null);
+
+    const formData = new FormData();
+    formData.set("resortId", resortId);
+    formData.set("siteNumber", newSiteNumber.trim());
+    formData.set("lat", String(pending.lat));
+    formData.set("lng", String(pending.lng));
+
+    const result = await tracked(() => addSite({}, formData));
+    setIsSaving(false);
+
+    if (result.error || !result.siteId) {
+      setSaveError(result.error ?? "Saved, but the map couldn't track it — reload the page.");
+      return;
+    }
+
+    setSites((prev) => [
+      ...prev,
+      {
+        // The database's id, not an invented one: everything done to this
+        // pin afterwards is addressed by it.
+        id: result.siteId!,
+        site_number: newSiteNumber.trim(),
+        label: null,
+        lat: pending.lat,
+        lng: pending.lng,
+        status: "draft",
+      },
+    ]);
+    pushUndo({
+      kind: "add",
+      siteId: result.siteId,
+      siteNumber: newSiteNumber.trim(),
+    });
+    setPending(null);
+    setNewSiteNumber("");
+    setSiteNumberToPlace(null);
+  }
+
+  function pushUndo(entry: UndoEntry) {
+    setUndoStack((prev) => [...prev, entry].slice(-UNDO_LIMIT));
+  }
+
+  async function handleDragEnd(siteId: string, lat: number, lng: number) {
+    const previous = sites;
+    const before = previous.find((s) => s.id === siteId);
+    setSites((prev) => prev.map((s) => (s.id === siteId ? { ...s, lat, lng } : s)));
+
+    const formData = new FormData();
+    formData.set("siteId", siteId);
+    formData.set("resortId", resortId);
+    formData.set("lat", String(lat));
+    formData.set("lng", String(lng));
+
+    const result = await tracked(() => updateSiteLocation({}, formData));
+    if (result.error) {
+      // Put the pin back where it was and say so - a pin that springs
+      // back with no explanation looks like the map is broken.
+      setSites(previous);
+      setActionError(result.error);
+      return;
+    }
+    if (before) {
+      pushUndo({
+        kind: "move",
+        siteId,
+        siteNumber: before.site_number,
+        lat: before.lat,
+        lng: before.lng,
+      });
+    }
+  }
+
+  async function handleDelete(siteId: string, siteNumber: string) {
+    if (!confirm(`Delete site ${siteNumber}? The pin and the site both go.`)) return;
+    const previous = sites;
+    const removed = previous.find((s) => s.id === siteId);
+    setActionError(null);
+    setSites((prev) => prev.filter((s) => s.id !== siteId));
+    if (selectedSiteId === siteId) setSelectedSiteId(null);
+
+    const formData = new FormData();
+    formData.set("siteId", siteId);
+    formData.set("resortId", resortId);
+    try {
+      await tracked(() => deleteSite(formData));
+      if (removed) pushUndo({ kind: "delete", site: removed });
+    } catch {
+      setSites(previous);
+      setActionError(`Site ${siteNumber} couldn't be deleted — it's still there.`);
+    }
+  }
+
+  // Correcting a misread number is the single commonest fix after an
+  // import off a drawing - a 1 read as a 7, a stage number picked up as a
+  // site - and until now it meant leaving the map for the sites list,
+  // where you can't see which house you're looking at.
+  async function handleRename(siteId: string, nextNumber: string) {
+    const trimmed = nextNumber.trim();
+    const before = sites.find((s) => s.id === siteId);
+    if (!before || !trimmed || trimmed === before.site_number) {
+      setRenamingId(null);
+      return;
+    }
+
+    setActionError(null);
+    const formData = new FormData();
+    formData.set("siteId", siteId);
+    formData.set("resortId", resortId);
+    formData.set("siteNumber", trimmed);
+    // Carried through deliberately: the action treats an absent label as
+    // "clear it", so leaving it out would wipe the label on every rename.
+    formData.set("label", before.label ?? "");
+
+    const result = await tracked(() => updateSiteDetails({}, formData));
+    if (result.error) {
+      setActionError(result.error);
+      return;
+    }
+
+    setSites((prev) =>
+      prev.map((s) => (s.id === siteId ? { ...s, site_number: trimmed } : s))
+    );
+    pushUndo({ kind: "rename", siteId, siteNumber: before.site_number });
+    setRenamingId(null);
+  }
+
+  async function handleStatusChange(siteId: string, status: SiteStatus) {
+    const previous = sites;
+    const before = previous.find((s) => s.id === siteId);
+    setSites((prev) => prev.map((s) => (s.id === siteId ? { ...s, status } : s)));
+
+    const formData = new FormData();
+    formData.set("siteId", siteId);
+    formData.set("resortId", resortId);
+    formData.set("status", status);
+    try {
+      await tracked(() => setSiteStatus(formData));
+      if (before) {
+        pushUndo({
+          kind: "status",
+          siteId,
+          siteNumber: before.site_number,
+          status: before.status,
+        });
+      }
+    } catch {
+      setSites(previous);
+      setActionError("That status change didn't save.");
+    }
+  }
+
+  // Reverses the last change. Each step is undone against the database
+  // too, not just on screen - the point is to put right something that
+  // was already saved.
+  async function handleUndo() {
+    const entry = undoStack[undoStack.length - 1];
+    if (!entry) return;
+
+    setIsUndoing(true);
+    setActionError(null);
+    setUndoStack((prev) => prev.slice(0, -1));
+
+    // Undo failures put the step back on the stack: better to be able to
+    // try again than to lose the only record of what happened.
+    const failed = (message: string) => {
+      setActionError(message);
+      setUndoStack((prev) => [...prev, entry]);
+    };
+
+    try {
+      if (entry.kind === "move") {
+        const formData = new FormData();
+        formData.set("siteId", entry.siteId);
+        formData.set("resortId", resortId);
+        formData.set("lat", String(entry.lat));
+        formData.set("lng", String(entry.lng));
+        const result = await updateSiteLocation({}, formData);
+        if (result.error) {
+          failed(result.error);
+        } else {
+          setSites((prev) =>
+            prev.map((s) =>
+              s.id === entry.siteId ? { ...s, lat: entry.lat, lng: entry.lng } : s
+            )
+          );
+        }
+      } else if (entry.kind === "add") {
+        const formData = new FormData();
+        formData.set("siteId", entry.siteId);
+        formData.set("resortId", resortId);
+        await deleteSite(formData);
+        setSites((prev) => prev.filter((s) => s.id !== entry.siteId));
+        // Anything earlier in the history about a row that no longer
+        // exists can never be undone, so drop it rather than leave a step
+        // that fails every time it's reached.
+        setUndoStack((prev) => prev.filter((e) => undoTarget(e) !== entry.siteId));
+      } else if (entry.kind === "rename") {
+        const current = sites.find((s) => s.id === entry.siteId);
+        const formData = new FormData();
+        formData.set("siteId", entry.siteId);
+        formData.set("resortId", resortId);
+        formData.set("siteNumber", entry.siteNumber);
+        formData.set("label", current?.label ?? "");
+        const result = await updateSiteDetails({}, formData);
+        if (result.error) {
+          failed(result.error);
+        } else {
+          setSites((prev) =>
+            prev.map((s) =>
+              s.id === entry.siteId ? { ...s, site_number: entry.siteNumber } : s
+            )
+          );
+        }
+      } else if (entry.kind === "delete") {
+        const result = await restoreSite({
+          resortId,
+          siteNumber: entry.site.site_number,
+          label: entry.site.label,
+          status: entry.site.status,
+          lat: entry.site.lat,
+          lng: entry.site.lng,
+        });
+        if (result.error || !result.siteId) {
+          failed(result.error ?? "Couldn't put that site back.");
+        } else {
+          // A restored row is a new row, so the map takes the new id -
+          // and so does any earlier step in the history that referred to
+          // the old one, which would otherwise fail on a row that's gone.
+          const newId = result.siteId;
+          setSites((prev) => [...prev, { ...entry.site, id: newId }]);
+          setUndoStack((prev) =>
+            prev.map((e) =>
+              e.kind !== "delete" && e.siteId === entry.site.id ? { ...e, siteId: newId } : e
+            )
+          );
+        }
+      } else {
+        const formData = new FormData();
+        formData.set("siteId", entry.siteId);
+        formData.set("resortId", resortId);
+        formData.set("status", entry.status);
+        await setSiteStatus(formData);
+        setSites((prev) =>
+          prev.map((s) => (s.id === entry.siteId ? { ...s, status: entry.status } : s))
+        );
+      }
+    } catch {
+      failed("That couldn't be undone — check your connection and try again.");
+    } finally {
+      setIsUndoing(false);
+    }
+  }
+
+  function jumpTo(siteNumber: string) {
+    const match = sites.find(
+      (s) => s.site_number.toLowerCase() === siteNumber.trim().toLowerCase()
+    );
+    if (match && mapRef.current) {
+      setSearchTerm(match.site_number);
+      setSelectedSiteId(match.id);
+      setRenamingId(null);
+      mapRef.current.flyTo([match.lat, match.lng], 21);
+    }
+  }
+
+  function handleSearch() {
+    jumpTo(searchTerm);
+  }
+
+  const selectedSite = sites.find((s) => s.id === selectedSiteId) ?? null;
+
+  const numbers = analyseSiteNumbers(
+    sites.map((s) => s.site_number),
+    totalHomes
+  );
+
+  const progressLabel = totalHomes
+    ? `${sites.length} of ${totalHomes} homes captured`
+    : `${sites.length} homes captured`;
+  const progressPct = totalHomes ? Math.min(100, (sites.length / totalHomes) * 100) : null;
+
+  return (
+    <div className="flex h-[calc(100vh-8rem)] flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-4">
+        <div className="min-w-48 flex-1">
+          <p className="text-sm font-medium">{progressLabel}</p>
+          {progressPct !== null && (
+            <div className="mt-1 h-2 w-full max-w-xs rounded-full bg-neutral-100">
+              <div
+                className="h-2 rounded-full bg-green-600"
+                style={{ width: `${progressPct}%` }}
+              />
+            </div>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            type="text"
+            placeholder="Jump to site #"
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+            className="w-32 rounded-md border border-neutral-300 px-2 py-1 text-sm"
+          />
+          <button
+            type="button"
+            onClick={handleSearch}
+            className="shrink-0 whitespace-nowrap rounded-md border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-50"
+          >
+            Go
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              sites.length > 0 &&
+              mapRef.current?.fitBounds(
+                sites.map((s) => [s.lat, s.lng] as [number, number]),
+                { padding: [50, 50] }
+              )
+            }
+            className="shrink-0 whitespace-nowrap rounded-md border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-50"
+          >
+            Fit to all sites
+          </button>
+          <button
+            type="button"
+            onClick={handleUndo}
+            disabled={undoStack.length === 0 || isUndoing}
+            className="shrink-0 whitespace-nowrap rounded-md border border-neutral-300 px-2 py-1 text-sm hover:bg-neutral-50 disabled:opacity-40"
+          >
+            {isUndoing
+              ? "Undoing…"
+              : undoStack.length > 0
+                ? `Undo ${describeUndo(undoStack[undoStack.length - 1])}`
+                : "Undo"}
+          </button>
+          {/* Space held whether or not it is showing: this row sits
+              above the map, and a line that appears and disappears
+              shifts everything beside it between taps. */}
+          <span
+            aria-live="polite"
+            className={
+              writesInFlight > 0
+                ? "flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm font-medium text-[#702890]"
+                : "invisible flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm"
+            }
+          >
+            <span
+              aria-hidden="true"
+              className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-[#702890] motion-reduce:animate-none"
+            />
+            Saving{writesInFlight > 1 ? ` ${writesInFlight} changes` : ""}…
+          </span>
+          <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm">
+            <input
+              type="checkbox"
+              checked={showNumbers}
+              onChange={(e) => setShowNumbers(e.target.checked)}
+            />
+            Numbers
+          </label>
+          <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm">
+            <input
+              type="checkbox"
+              checked={pinsLocked}
+              onChange={(e) => togglePinsLocked(e.target.checked)}
+            />
+            Lock pins
+          </label>
+          {georeference && (
+            <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm">
+              <input
+                type="checkbox"
+                checked={showPlan}
+                onChange={(e) => togglePlan(e.target.checked)}
+              />
+              Master plan
+            </label>
+          )}
+          {showPlan && planImage && (
+            <label className="flex shrink-0 items-center gap-2 whitespace-nowrap text-xs text-neutral-500">
+              Fade
+              <input
+                type="range"
+                min={0.15}
+                max={1}
+                step={0.05}
+                value={planOpacity}
+                onChange={(e) => setPlanOpacity(Number(e.target.value))}
+                className="w-20"
+              />
+            </label>
+          )}
+        </div>
+      </div>
+
+      {/* Too many sites for the resort's home count. Numbers above the
+          total are the first place to look, but only because there are
+          too many - a resort whose numbering simply runs past its home
+          count is normal and says nothing is wrong. */}
+      {numbers.surplus > 0 && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3">
+          <button
+            type="button"
+            onClick={() => setShowUnexpected((v) => !v)}
+            className="flex w-full items-center justify-between gap-2 text-left text-sm font-medium text-amber-900"
+          >
+            <span>
+              {numbers.surplus} more site{numbers.surplus === 1 ? "" : "s"} than
+              the {totalHomes} homes at this resort
+            </span>
+            <span aria-hidden>{showUnexpected ? "-" : "+"}</span>
+          </button>
+          {showUnexpected && (
+            <div className="mt-2 flex flex-col gap-2">
+              <p className="text-xs text-amber-900">
+                Scanning a drawing picks up stage numbers, drawing references
+                and misread digits. Numbers above {totalHomes} are the first
+                place to look, though they can be genuine if the numbering runs
+                past the home count. Tap one to go to it.
+              </p>
+              {numbers.aboveTotal.length > 0 && (
+                <div className="flex max-h-32 flex-wrap gap-1 overflow-auto">
+                  {numbers.aboveTotal.map((number) => (
+                    <button
+                      key={number}
+                      type="button"
+                      onClick={() => jumpTo(number)}
+                      className="rounded bg-white px-1.5 py-0.5 text-xs text-amber-900 hover:bg-amber-100"
+                    >
+                      {number}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Only while sites are genuinely outstanding. Gaps in the numbering
+          are candidates for what's missing, not a count of it: numbers get
+          skipped when lots are merged or dropped, and treating every gap as
+          a missing home reported eight phantom houses at a resort that was
+          finished. */}
+      {numbers.outstanding > 0 && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3">
+          <button
+            type="button"
+            onClick={() => setShowMissing((v) => !v)}
+            className="flex w-full items-center justify-between gap-2 text-left text-sm font-medium text-amber-900"
+          >
+            <span>
+              {numbers.outstanding} more site
+              {numbers.outstanding === 1 ? "" : "s"} to capture
+            </span>
+            <span aria-hidden>{showMissing ? "-" : "+"}</span>
+          </button>
+          {showMissing && (
+            <div className="mt-2 flex flex-col gap-2">
+              <p className="text-xs text-amber-900">
+                {numbers.gaps.length} number
+                {numbers.gaps.length === 1 ? " has" : "s have"} no site, within
+                the 1-{Math.max(numbers.highest, totalHomes ?? 0)} the numbering
+                covers. Some of these may never have been used - tap one to load
+                it, then tap its spot on the map.
+              </p>
+              <div className="flex max-h-32 flex-wrap gap-1 overflow-auto">
+                {numbers.gaps.map((number) => (
+                  <button
+                    key={number}
+                    type="button"
+                    onClick={() => setSiteNumberToPlace(number)}
+                    className={
+                      siteNumberToPlace === number
+                        ? "rounded bg-amber-600 px-1.5 py-0.5 text-xs font-medium text-white"
+                        : "rounded bg-white px-1.5 py-0.5 text-xs text-amber-900 hover:bg-amber-100"
+                    }
+                  >
+                    {number}
+                  </button>
+                ))}
+              </div>
+              {numbers.gapsTruncated && (
+                <p className="text-xs text-amber-800">
+                  Only the first {numbers.gaps.length} are listed.
+                </p>
+              )}
+              <p className="break-words text-xs text-amber-800">
+                Gaps: {summariseRanges(numbers.gaps).join(", ")}
+              </p>
+              {numbers.ignored.length > 0 && (
+                <p className="break-words text-xs text-amber-800">
+                  Not included in this check (not plain numbers):{" "}
+                  {numbers.ignored.join(", ")}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* The finished state deserves saying out loud, including what the
+          leftover gaps are, so nobody goes hunting for houses that were
+          never built. */}
+      {totalHomes !== null && numbers.outstanding === 0 && numbers.surplus === 0 && (
+        <p className="rounded-md border border-green-300 bg-green-50 px-3 py-2 text-sm text-green-900">
+          <strong>All {totalHomes} homes captured.</strong>
+          {numbers.gaps.length > 0 && (
+            <>
+              {" "}
+              Numbering runs 1-{numbers.highest}, with {numbers.gaps.length}{" "}
+              number{numbers.gaps.length === 1 ? "" : "s"} not in use:{" "}
+              {summariseRanges(numbers.gaps).join(", ")}.
+            </>
+          )}
+        </p>
+      )}
+
+      {planLoading && (
+        <p className="text-xs text-neutral-500">Loading the master plan image…</p>
+      )}
+
+      {planUnavailable && <PlanOverlayNote reason={planUnavailable} resortId={resortId} />}
+
+      {actionError && (
+        <p className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{actionError}</p>
+      )}
+
+      {/* The unsaved pin can lose its popup with one stray tap, and until
+          now the only way to get rid of it was to find the popup again.
+          A pin you can't put down is alarming when you're not sure
+          whether it saved. */}
+      {/* Editing lives here rather than in a map popup. A tap inside a
+          Leaflet popup reaches the map underneath, and the map closes its
+          popup on tap, so the first tap on any control shut the thing it
+          was in - a rename box could be opened but never filled in. A
+          panel above the map also gives full-size touch targets and stays
+          put while the map moves. */}
+      {pending && (
+        <div className="flex flex-col gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-3 text-sm text-amber-900">
+          <label className="flex flex-col gap-1 font-medium">
+            New pin — site number
+            <SiteNumberInput
+              autoFocus
+              value={newSiteNumber}
+              onChange={setNewSiteNumber}
+              onEnter={handleSaveNewSite}
+              ariaLabel="Site number for the new pin"
+            />
+          </label>
+          {saveError && <p className="text-red-700">{saveError}</p>}
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={isSaving || !newSiteNumber.trim()}
+              onClick={handleSaveNewSite}
+              className="rounded-md bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+            >
+              {isSaving ? "Saving…" : "Save site"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setPending(null);
+                setNewSiteNumber("");
+                setSaveError(null);
+              }}
+              className="rounded-md border border-amber-400 bg-white px-3 py-1.5 text-sm font-medium"
+            >
+              Remove pin
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!pending && selectedSite && (
+        <div className="flex flex-col gap-2 rounded-md border border-neutral-300 bg-white p-3 text-sm">
+          {renamingId === selectedSite.id ? (
+            <label className="flex flex-col gap-1 font-medium">
+              Site number
+              <SiteNumberInput
+                autoFocus
+                value={renameValue}
+                onChange={setRenameValue}
+                onEnter={() => void handleRename(selectedSite.id, renameValue)}
+                onEscape={() => setRenamingId(null)}
+                ariaLabel="Site number"
+              />
+            </label>
+          ) : (
+            <div className="flex flex-wrap items-center gap-3">
+              <strong className="text-base">Site {selectedSite.site_number}</strong>
+              {selectedSite.label && (
+                <span className="text-neutral-500">{selectedSite.label}</span>
+              )}
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center gap-2">
+            {renamingId === selectedSite.id ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void handleRename(selectedSite.id, renameValue)}
+                  className="rounded-md bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white"
+                >
+                  Save number
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRenamingId(null)}
+                  className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm"
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRenamingId(selectedSite.id);
+                    setRenameValue(selectedSite.site_number);
+                  }}
+                  className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm"
+                >
+                  Rename
+                </button>
+                <label className="flex items-center gap-1.5">
+                  Status
+                  <select
+                    value={selectedSite.status}
+                    onChange={(e) =>
+                      handleStatusChange(selectedSite.id, e.target.value as SiteStatus)
+                    }
+                    className="rounded border border-neutral-300 px-2 py-1"
+                  >
+                    <option value="draft">Draft</option>
+                    <option value="active">Active</option>
+                    <option value="inactive">Inactive</option>
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  onClick={() =>
+                    void handleDelete(selectedSite.id, selectedSite.site_number)
+                  }
+                  className="rounded-md border border-red-300 px-3 py-1.5 text-sm text-red-700"
+                >
+                  Delete
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedSiteId(null)}
+                  className="ml-auto text-neutral-700 underline"
+                >
+                  Done
+                </button>
+              </>
+            )}
+          </div>
+
+          {pinsLocked && (
+            <button
+              type="button"
+              onClick={() => togglePinsLocked(false)}
+              className="w-fit text-left text-xs text-neutral-700 underline"
+            >
+              Pins are locked — unlock to drag this one
+            </button>
+          )}
+        </div>
+      )}
+
+      <p className="text-xs text-neutral-700">
+        {siteNumberToPlace
+          ? `Site ${siteNumberToPlace} loaded — tap its position on the map.`
+          : pinsLocked
+            ? "Tap the imagery to drop a pin for a new site. Tap an existing pin to change its status or delete it. Pins are locked so they can't be nudged while you pan and zoom — untick Lock pins to move one. Amber = draft, green = active, gray = inactive."
+            : "Pins are unlocked: drag one to correct its position. Tap the imagery to drop a pin for a new site, or tap an existing pin to change its status or delete it. Amber = draft, green = active, gray = inactive."}
+      </p>
+
+      <div className="flex-1 overflow-hidden rounded-md border border-neutral-300">
+        <MapContainer
+          center={initialCenter}
+          zoom={sites.length > 0 ? defaultZoom : defaultZoom - 2}
+          className="h-full w-full"
+          ref={mapRef}
+        >
+          <BasemapTileLayer />
+
+          <FitToAllSitesOnce
+            points={sites.map((s) => [s.lat, s.lng] as [number, number])}
+          />
+
+          {showPlan && planImage && georeference && planCalibration && (
+            <PlanImageOverlay
+              imageUrl={planImage}
+              imageWidth={planCalibration.imageWidth}
+              imageHeight={planCalibration.imageHeight}
+              topLeft={georeference.topLeft}
+              topRight={georeference.topRight}
+              bottomLeft={georeference.bottomLeft}
+              opacity={planOpacity}
+            />
+          )}
+
+          <ClickToAdd
+            onPick={(lat, lng) => {
+              setPending({ lat, lng });
+              setSelectedSiteId(null);
+              // If staff picked one of the outstanding numbers from the
+              // panel, use it rather than making them retype it.
+              if (siteNumberToPlace) setNewSiteNumber(siteNumberToPlace);
+              setSaveError(null);
+            }}
+          />
+
+          {sites.map((site) => (
+            <Marker
+              key={site.id}
+              position={[site.lat, site.lng]}
+              icon={
+                showNumbers
+                  ? labelledSiteDivIcon(
+                      site.status,
+                      site.site_number,
+                      site.id === selectedSiteId
+                    )
+                  : siteDivIcon(site.status, site.id === selectedSiteId)
+              }
+              draggable={!pinsLocked}
+              eventHandlers={{
+                click: () => {
+                  setSelectedSiteId(site.id);
+                  setRenamingId(null);
+                  setActionError(null);
+                },
+                dragend: (e) => {
+                  const latlng = e.target.getLatLng();
+                  handleDragEnd(site.id, latlng.lat, latlng.lng);
+                },
+              }}
+            />
+          ))}
+
+          {pending && (
+            <Marker
+              position={[pending.lat, pending.lng]}
+              icon={siteDivIcon("draft", true)}
+            />
+          )}
+
+        </MapContainer>
+      </div>
+    </div>
+  );
+}

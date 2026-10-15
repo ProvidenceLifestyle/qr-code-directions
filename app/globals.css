@@ -1,0 +1,165 @@
+@import "tailwindcss";
+
+/* This app is light, deliberately.
+ *
+ * Every panel, popup and map control is drawn on a fixed light surface -
+ * white cards, amber notices, satellite imagery with white-outlined pins.
+ * The scaffold shipped with a prefers-color-scheme block that flipped the
+ * text colour to near-white on a phone set to dark mode, while those
+ * surfaces stayed light: white text on a white card. On an iPhone in dark
+ * mode the whole editing panel was barely readable.
+ *
+ * Making the admin genuinely dark-mode aware would mean a second colour
+ * for every surface in it, and this is a tool used outdoors in daylight
+ * against satellite imagery, which is light whatever the phone is set to.
+ * So it declares itself light and stays consistent.
+ *
+ * color-scheme matters as much as the colours: without it iOS renders
+ * selects, inputs and scrollbars in dark chrome inside our light panels.
+ */
+:root {
+  color-scheme: light;
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+/* Buttons that acknowledge being pressed.
+ *
+ * Nothing here changed what any button does - it changes whether you can
+ * tell you hit it. Most of this app is used on a phone, outdoors, often
+ * one-handed while standing next to the thing being edited, and a tap
+ * that produces no change until a server answers reads as a tap that
+ * missed. The usual result is a second tap.
+ *
+ * Done once here rather than on each of the seventy-odd buttons, so it
+ * is consistent and so a button added later gets it without anyone
+ * remembering to.
+ *
+ * cursor: pointer is load-bearing on iOS, not decoration: Safari only
+ * applies :active to an element it considers clickable, and a plain
+ * <button> without it can be pressed with no state change at all.
+ *
+ * The tap highlight is switched off because we draw our own, which is
+ * immediate and consistent, rather than leaving iOS to flash a grey box
+ * over a purple button.
+ */
+button,
+[role="button"],
+a[href],
+summary {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:not(:disabled),
+[role="button"],
+a[href],
+summary {
+  cursor: pointer;
+  transition:
+    transform 90ms ease,
+    filter 90ms ease;
+}
+
+/* The press itself, and then the state it leaves behind.
+ *
+ * :active covers the finger being down. data-pressed is added by
+ * components/ui/press-feedback.tsx and held for most of a second after
+ * release, because the silence between lifting a finger and a server
+ * answering is exactly where a button that has reverted to normal invites
+ * a second press.
+ *
+ * The halo is what carries it rather than a fill, because these buttons
+ * are white, purple, amber, black and red, and no single fill reads as
+ * "pressed" on all of them. A ring drawn outside the button sits on the
+ * page, which is white everywhere in this app, so it reads the same
+ * whatever the button under it is doing. */
+button:not(:disabled):active,
+[role="button"]:active,
+summary:active,
+button[data-pressed]:not(:disabled),
+[role="button"][data-pressed],
+a[data-press][data-pressed] {
+  transform: scale(0.97);
+  filter: brightness(0.88);
+  box-shadow:
+    0 0 0 4px rgba(112, 40, 144, 0.95),
+    0 0 0 8px rgba(112, 40, 144, 0.35);
+}
+
+/* A disabled button keeps the halo rather than losing it, because
+ * "disabled" here means "this is what you just pressed and it is still
+ * going" - which is the moment the halo is most needed. It only drops
+ * the press-down scale, so it does not sit there looking squashed for
+ * however long the server takes. */
+button:disabled[data-pressed] {
+  transform: none;
+  filter: none;
+  box-shadow:
+    0 0 0 4px rgba(112, 40, 144, 0.95),
+    0 0 0 8px rgba(112, 40, 144, 0.35);
+  /* Full strength, overriding the disabled:opacity-* these buttons carry.
+   * Opacity applies to the halo as well as the button, so leaving it
+   * would fade the ring at exactly the moment it is doing its job. The
+   * dimming is no loss: the halo and the changed label already say this
+   * one is busy, and a faded button wearing a bright ring says two
+   * contradictory things at once. */
+  opacity: 1;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+/* Links that are not dressed as buttons - "← All resorts", Backup,
+ * Download PNG, the QR code's own address - are marked with a wash of
+ * colour instead of a ring.
+ *
+ * A box-shadow on an inline element is drawn around each line box
+ * separately, so a link that wraps, as that address does over three
+ * lines, would come back fenced into pieces. A background survives
+ * wrapping intact, and on a text link it reads as clearly as the ring
+ * does on a button. */
+a[href]:not([data-press])[data-pressed] {
+  background-color: rgba(112, 40, 144, 0.18);
+  box-shadow: 0 0 0 2px rgba(112, 40, 144, 0.18);
+  border-radius: 3px;
+}
+
+/* A visible focus ring for anyone driving this from a keyboard, which
+ * the tap feedback above does nothing for. */
+button:focus-visible,
+[role="button"]:focus-visible,
+a:focus-visible {
+  outline: 2px solid #702890;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button,
+  [role="button"],
+  summary {
+    transition: none;
+  }
+  button:not(:disabled):active,
+  [role="button"]:active,
+  summary:active,
+  button[data-pressed]:not(:disabled),
+  [role="button"][data-pressed],
+  a[data-press][data-pressed] {
+    transform: none;
+  }
+}
