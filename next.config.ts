@@ -48,6 +48,19 @@ const nextConfig: NextConfig = {
   outputFileTracingExcludes: {
     "*": ["node_modules/@napi-rs/canvas-linux-x64-musl/**"],
   },
+
+  // Restoring a backup sends the whole JSON file through a server action,
+  // and the default 1 MB cap refused the first real one: three resorts
+  // came to 2.8 MB, nearly all of it the published master plan images.
+  // 4 MB is as far as this can usefully go - Vercel rejects any function
+  // request body over 4.5 MB before it reaches the app - so a backup with
+  // several more plans will outgrow it and restore will need to stop
+  // going through a single request.
+  experimental: {
+    serverActions: {
+      bodySizeLimit: "4mb",
+    },
+  },
 };
 
 export default nextConfig;
