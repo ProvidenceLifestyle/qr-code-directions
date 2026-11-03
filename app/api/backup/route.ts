@@ -56,21 +56,32 @@ export async function GET(request: Request) {
         "id, name, slug, is_published, default_zoom, total_homes, center_lat, center_lng, entrance_node_id, map_bearing_deg, created_at"
       )
       .order("name"),
-    supabase
-      .from("sites")
-      .select(
-        "id, resort_id, site_number, label, status, lat, lng, gps_accuracy_m, graph_node_id, created_at, updated_at"
-      )
-      .order("resort_id")
-      .order("site_number"),
-    supabase
-      .from("graph_nodes")
-      .select("id, resort_id, lat, lng, node_type")
-      .order("resort_id"),
-    supabase
-      .from("graph_edges_view")
-      .select("id, resort_id, from_node_id, to_node_id, path_type, is_bidirectional, geojson")
-      .order("resort_id"),
+    readAll((from, to) =>
+      supabase
+        .from("sites")
+        .select(
+          "id, resort_id, site_number, label, status, lat, lng, gps_accuracy_m, graph_node_id, created_at, updated_at"
+        )
+        .order("resort_id")
+        .order("site_number")
+        .range(from, to)
+    ),
+    readAll((from, to) =>
+      supabase
+        .from("graph_nodes")
+        .select("id, resort_id, lat, lng, node_type")
+        .order("resort_id")
+        .order("id")
+        .range(from, to)
+    ),
+    readAll((from, to) =>
+      supabase
+        .from("graph_edges_view")
+        .select("id, resort_id, from_node_id, to_node_id, path_type, is_bidirectional, geojson")
+        .order("resort_id")
+        .order("id")
+        .range(from, to)
+    ),
     supabase
       .from("resort_plan_overlays")
       .select(
@@ -137,6 +148,31 @@ export async function GET(request: Request) {
     "text/csv; charset=utf-8",
     backupFileName("sites.csv")
   );
+}
+
+// Supabase caps every read at 1,000 rows and says nothing when it does.
+// The first real restore found out the hard way: three resorts' road
+// networks came to 1,000 nodes and 1,000 segments exactly, and the last
+// resort in the list lost the junctions its roads, entrance and homes
+// pointed at. So read page by page until a page comes back empty - not
+// until one comes back short, which would stop early on a project whose
+// cap is set lower than the page size asked for. The ordering has to be
+// total (hence the trailing id) or rows can repeat or go missing between
+// pages.
+async function readAll<T>(
+  page: (
+    from: number,
+    to: number
+  ) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>
+): Promise<{ data: T[]; error: { message: string } | null }> {
+  const PAGE = 1000;
+  const rows: T[] = [];
+  for (;;) {
+    const { data, error } = await page(rows.length, rows.length + PAGE - 1);
+    if (error) return { data: rows, error };
+    if (!data || data.length === 0) return { data: rows, error: null };
+    rows.push(...data);
+  }
 }
 
 function fileResponse(body: string, contentType: string, fileName: string) {
